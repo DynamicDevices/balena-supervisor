@@ -2,6 +2,7 @@ import { promises as fs } from 'fs';
 import path from 'path';
 import type { Stats } from 'fs';
 import { isRight } from 'fp-ts/lib/Either';
+import _ from 'lodash';
 
 import {
 	isENOENT,
@@ -22,6 +23,15 @@ export const LOCKFILE_UID = isRight(decodedUid) ? decodedUid.right : 65534;
 
 export const BASE_LOCK_DIR =
 	process.env.BASE_LOCK_DIR || '/tmp/balena-supervisor/services';
+
+// On startup, store locks taken from filesystem in memory
+export const initialized = _.once(async () => {
+	await lockfile.initializeLocksTaken(
+		pathOnRoot(BASE_LOCK_DIR),
+		(p: string, s: Stats) =>
+			p.endsWith('updates.lock') && s.uid === LOCKFILE_UID,
+	);
+});
 
 export function lockPath(appId: number, serviceName?: string): string {
 	return path.join(BASE_LOCK_DIR, appId.toString(), serviceName ?? '');
@@ -69,8 +79,8 @@ async function dispose(
 	release: () => void,
 ): Promise<void> {
 	try {
-		const locks = await getLocksTaken(
-			pathOnRoot(`${BASE_LOCK_DIR}/${appIdentifier}`),
+		const locks = getLocksTaken().filter((l) =>
+			l.includes(pathOnRoot(`${BASE_LOCK_DIR}/${appIdentifier}`)),
 		);
 		// Try to unlock all locks taken
 		await Promise.all(locks.map((l) => lockfile.unlock(l)));
@@ -197,17 +207,9 @@ export class LocksTakenMap extends Map<number, Set<string>> {
 	}
 }
 
-// A wrapper function for lockfile.getLocksTaken that filters for Supervisor-taken locks.
+// A wrapper function for lockfile.getLocksTaken.
 // Exported for tests only; getServicesLockedByAppId is the intended public interface.
-export async function getLocksTaken(
-	rootDir: string = pathOnRoot(BASE_LOCK_DIR),
-): Promise<string[]> {
-	return await lockfile.getLocksTaken(
-		rootDir,
-		(p: string, s: Stats) =>
-			p.endsWith('updates.lock') && s.uid === LOCKFILE_UID,
-	);
-}
+export const getLocksTaken = lockfile.getLocksTaken;
 
 /**
  * Return a list of services that are locked by the Supervisor under each appId.
@@ -215,7 +217,7 @@ export async function getLocksTaken(
  * [appId, serviceName] pair for a service to be considered locked.
  */
 export async function getServicesLockedByAppId(): Promise<LocksTakenMap> {
-	const locksTaken = await getLocksTaken();
+	const locksTaken = getLocksTaken();
 	// Group locksTaken paths by appId & serviceName.
 	// filesTakenByAppId is of type Map<appId, Map<serviceName, Set<filename>>>
 	// and represents files taken under every [appId, serviceName] pair.

@@ -148,7 +148,7 @@ describe('lib/lockfile', () => {
 		await expect(fs.access(lock)).to.be.rejected;
 	});
 
-	it('should get locks taken with default args', async () => {
+	it('should get locks taken', async () => {
 		// Set up lock dirs
 		await fs.mkdir(`${lockdir}/1/main`, { recursive: true });
 		await fs.mkdir(`${lockdir}/2/aux`, { recursive: true });
@@ -165,65 +165,37 @@ describe('lib/lockfile', () => {
 		await Promise.all(locks.map((lock) => lockfile.lock(lock)));
 
 		// Assert all locks are listed as taken
-		expect(await lockfile.getLocksTaken(lockdir)).to.have.members(
-			locks.concat([`${lockdir}/other.lock`]),
-		);
+		expect(lockfile.getLocksTaken()).to.have.members(locks);
 
 		// Clean up locks
+		await Promise.all(locks.map((l) => lockfile.unlock(l)));
 		await fs.rm(`${lockdir}`, { recursive: true });
 	});
 
-	it('should get locks taken with a custom filter', async () => {
+	it('should read locks from filesystem', async () => {
 		// Set up lock dirs
-		await fs.mkdir(`${lockdir}/1`, { recursive: true });
-		await fs.mkdir(`${lockdir}/services/main`, { recursive: true });
-		await fs.mkdir(`${lockdir}/services/aux`, { recursive: true });
+		await fs.mkdir(`${lockdir}/1/main`, { recursive: true });
+		await fs.mkdir(`${lockdir}/2/aux`, { recursive: true });
 
-		// Take some locks...
-		// - with a specific UID
-		await lockfile.lock(`${lockdir}/updates.lock`, NOBODY_UID);
-		// - as a directory
-		await fs.mkdir(`${lockdir}/1/updates.lock`);
-		// - as a directory with a specific UID
-		await fs.mkdir(`${lockdir}/1/resin-updates.lock`);
-		await fs.chown(`${lockdir}/1/resin-updates.lock`, NOBODY_UID, NOBODY_UID);
-		// - under a different root dir from default
-		await lockfile.lock(`${lockdir}/services/main/updates.lock`);
-		await lockfile.lock(`${lockdir}/services/aux/resin-updates.lock`);
-
-		// Assert appropriate locks are listed as taken...
-		// - with a specific UID
-		expect(
-			await lockfile.getLocksTaken(
-				lockdir,
-				(p, stats) => p.endsWith('.lock') && stats.uid === NOBODY_UID,
-			),
-		).to.have.members([
+		// Take some locks without using lockfile.lock
+		const locks = [
 			`${lockdir}/updates.lock`,
-			`${lockdir}/1/resin-updates.lock`,
-			`${lockdir}/other.lock`,
-		]);
-		// - as a directory
-		expect(
-			await lockfile.getLocksTaken(
-				lockdir,
-				(p, stats) => p.endsWith('.lock') && stats.isDirectory(),
-			),
-		).to.have.members([
-			`${lockdir}/1/updates.lock`,
-			`${lockdir}/1/resin-updates.lock`,
-		]);
-		// - under a different root dir from default
-		expect(
-			await lockfile.getLocksTaken(`${lockdir}/services`, (p) =>
-				p.endsWith('.lock'),
-			),
-		).to.have.members([
-			`${lockdir}/services/main/updates.lock`,
-			`${lockdir}/services/aux/resin-updates.lock`,
-		]);
+			`${lockdir}/two.lock`,
+			`${lockdir}/1/main/updates.lock`,
+			`${lockdir}/1/main/resin-updates.lock`,
+			`${lockdir}/2/aux/updates.lock`,
+			`${lockdir}/2/aux/resin-updates.lock`,
+		];
+		await Promise.all(locks.map((lock) => fs.writeFile(lock, '')));
+
+		// Assert all locks are listed as taken
+		await lockfile.initializeLocksTaken(lockdir, (p) => p.endsWith('.lock'));
+		expect(lockfile.getLocksTaken()).to.have.members(
+			locks.concat(`${lockdir}/other.lock`),
+		);
 
 		// Clean up locks
+		await Promise.all(locks.map((l) => lockfile.unlock(l)));
 		await fs.rm(`${lockdir}`, { recursive: true });
 	});
 });

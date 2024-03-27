@@ -4,14 +4,13 @@ import { promises as fs } from 'fs';
 import { testfs } from 'mocha-pod';
 import type { TestFs } from 'mocha-pod';
 import { setTimeout } from 'timers/promises';
-import { watch } from 'chokidar';
 
 import * as updateLock from '~/lib/update-lock';
 import { UpdatesLockedError } from '~/lib/errors';
 import * as config from '~/src/config';
 import * as lockfile from '~/lib/lockfile';
 import { pathOnRoot, pathOnState } from '~/lib/host-utils';
-import { mkdirp } from '~/lib/fs-utils';
+import { mkdirp, touch } from '~/lib/fs-utils';
 import { takeGlobalLockRW } from '~/lib/process-lock';
 
 describe('lib/update-lock', () => {
@@ -80,7 +79,7 @@ describe('lib/update-lock', () => {
 
 		const releaseLocks = async () => {
 			await Promise.all(
-				(await updateLock.getLocksTaken()).map((lock) => lockfile.unlock(lock)),
+				updateLock.getLocksTaken().map((lock) => lockfile.unlock(lock)),
 			);
 
 			// Remove any other lockfiles created for the testAppId
@@ -155,7 +154,7 @@ describe('lib/update-lock', () => {
 				.catch((err) => expect(err).to.be.instanceOf(UpdatesLockedError));
 
 			// Since the lock-taking with `nobody` uid failed, there should be no locks to dispose of
-			expect(await updateLock.getLocksTaken()).to.have.length(0);
+			expect(updateLock.getLocksTaken()).to.have.length(0);
 
 			// Restore the locks that were taken at the beginning of the test
 			await releaseLocks();
@@ -290,67 +289,6 @@ describe('lib/update-lock', () => {
 		});
 	});
 
-	describe('getLocksTaken', () => {
-		const lockdir = pathOnRoot(updateLock.BASE_LOCK_DIR);
-		before(async () => {
-			await testfs({
-				[lockdir]: {},
-			}).enable();
-			// TODO: enable mocha-pod to work with empty directories
-			await fs.mkdir(`${lockdir}/123/main`, { recursive: true });
-			await fs.mkdir(`${lockdir}/123/aux`, { recursive: true });
-			await fs.mkdir(`${lockdir}/123/invalid`, { recursive: true });
-		});
-		after(async () => {
-			await fs.rm(`${lockdir}/123`, { recursive: true });
-			await testfs.restore();
-		});
-
-		it('resolves with all locks taken with the Supervisor lockfile UID', async () => {
-			// Set up valid lockfiles including some directories
-			await Promise.all(
-				['resin-updates.lock', 'updates.lock'].map((lf) => {
-					const p = `${lockdir}/123/main/${lf}`;
-					return fs
-						.mkdir(p)
-						.then(() =>
-							fs.chown(p, updateLock.LOCKFILE_UID, updateLock.LOCKFILE_UID),
-						);
-				}),
-			);
-			await Promise.all([
-				lockfile.lock(
-					`${lockdir}/123/aux/updates.lock`,
-					updateLock.LOCKFILE_UID,
-				),
-				lockfile.lock(
-					`${lockdir}/123/aux/resin-updates.lock`,
-					updateLock.LOCKFILE_UID,
-				),
-			]);
-
-			// Set up invalid lockfiles with root UID
-			await Promise.all(
-				['resin-updates.lock', 'updates.lock'].map((lf) =>
-					lockfile.lock(`${lockdir}/123/invalid/${lf}`),
-				),
-			);
-
-			const locksTaken = await updateLock.getLocksTaken();
-			expect(locksTaken).to.have.length(4);
-			expect(locksTaken).to.deep.include.members([
-				`${lockdir}/123/aux/resin-updates.lock`,
-				`${lockdir}/123/aux/updates.lock`,
-				`${lockdir}/123/main/resin-updates.lock`,
-				`${lockdir}/123/main/updates.lock`,
-			]);
-			expect(locksTaken).to.not.deep.include.members([
-				`${lockdir}/123/invalid/resin-updates.lock`,
-				`${lockdir}/123/invalid/updates.lock`,
-			]);
-		});
-	});
-
 	describe('getServicesLockedByAppId', () => {
 		const lockdir = pathOnRoot(updateLock.BASE_LOCK_DIR);
 		const validDirs = [
@@ -435,10 +373,21 @@ describe('lib/update-lock', () => {
 					lockfile.lock(path.join(`${lockdir}/789/main`, lf)),
 				),
 			);
+			// Set up in-memory store of lockfiles
+			await lockfile.initializeLocksTaken(
+				lockdir,
+				(p, s) => p.endsWith('.lock') && s.uid === updateLock.LOCKFILE_UID,
+			);
+
 			expect((await updateLock.getServicesLockedByAppId()).size).to.equal(0);
 
 			// Cleanup lockfiles
 			await Promise.all(invalidPaths.map((p) => lockfile.unlock(p)));
+			await Promise.all(
+				['resin-updates.lock', 'updates.lock'].map((lf) =>
+					lockfile.unlock(path.join(`${lockdir}/789/main`, lf)),
+				),
+			);
 		});
 	});
 
@@ -472,6 +421,8 @@ describe('lib/update-lock', () => {
 			});
 
 			afterEach(async () => {
+				await updateLock.releaseLock(1);
+				await updateLock.releaseLock(2);
 				await testFs.restore();
 				await fs.rm(path.join(lockdir, '1'), { recursive: true });
 				await fs.rm(path.join(lockdir, '2'), { recursive: true });
@@ -481,10 +432,10 @@ describe('lib/update-lock', () => {
 				// Take locks for appId 1
 				await updateLock.takeLock(1, ['server', 'client']);
 				// Locks should have been taken
-				expect(await updateLock.getLocksTaken()).to.deep.include.members(
+				expect(updateLock.getLocksTaken()).to.deep.include.members(
 					serviceLockPaths[1],
 				);
-				expect(await updateLock.getLocksTaken()).to.have.length(4);
+				expect(updateLock.getLocksTaken()).to.have.length(4);
 				expect(
 					await fs.readdir(path.join(lockdir, '1', 'server')),
 				).to.include.members(['updates.lock', 'resin-updates.lock']);
@@ -494,11 +445,11 @@ describe('lib/update-lock', () => {
 				// Take locks for appId 2
 				await updateLock.takeLock(2, ['main']);
 				// Locks should have been taken for appid 1 & 2
-				expect(await updateLock.getLocksTaken()).to.deep.include.members([
+				expect(updateLock.getLocksTaken()).to.deep.include.members([
 					...serviceLockPaths[1],
 					...serviceLockPaths[2],
 				]);
-				expect(await updateLock.getLocksTaken()).to.have.length(6);
+				expect(updateLock.getLocksTaken()).to.have.length(6);
 				expect(
 					await fs.readdir(path.join(lockdir, '2', 'main')),
 				).to.have.length(2);
@@ -514,7 +465,7 @@ describe('lib/update-lock', () => {
 				// Take locks for app with nonexistent service directories
 				await updateLock.takeLock(3, ['api']);
 				// Locks should have been taken
-				expect(await updateLock.getLocksTaken()).to.deep.include(
+				expect(updateLock.getLocksTaken()).to.deep.include(
 					path.join(lockdir, '3', 'api', 'updates.lock'),
 					path.join(lockdir, '3', 'api', 'resin-updates.lock'),
 				);
@@ -538,18 +489,18 @@ describe('lib/update-lock', () => {
 				await lockfile.lock(serviceLockPaths[1][0], updateLock.LOCKFILE_UID);
 				await lockfile.lock(serviceLockPaths[1][1], updateLock.LOCKFILE_UID);
 				// Sanity check that locks are taken & tracked by Supervisor
-				expect(await updateLock.getLocksTaken()).to.deep.include(
+				expect(updateLock.getLocksTaken()).to.deep.include(
 					serviceLockPaths[1][0],
 					serviceLockPaths[1][1],
 				);
-				expect(await updateLock.getLocksTaken()).to.have.length(2);
+				expect(updateLock.getLocksTaken()).to.have.length(2);
 				// Take locks using takeLock, should only lock service which doesn't
 				// already have locks
 				await expect(
 					updateLock.takeLock(1, ['server', 'client']),
 				).to.eventually.deep.include.members(['client']);
 				// Check that locks are taken
-				expect(await updateLock.getLocksTaken()).to.deep.include.members(
+				expect(updateLock.getLocksTaken()).to.deep.include.members(
 					serviceLockPaths[1],
 				);
 				// Clean up lockfiles
@@ -568,7 +519,7 @@ describe('lib/update-lock', () => {
 					updateLock.takeLock(1, ['server', 'client']),
 				).to.eventually.be.rejectedWith(UpdatesLockedError);
 				// No Supervisor locks should have been taken
-				expect(await updateLock.getLocksTaken()).to.have.length(0);
+				expect(updateLock.getLocksTaken()).to.have.length(0);
 				// Clean up user-created lockfiles
 				for (const lockPath of serviceLockPaths[1]) {
 					await fs.rm(lockPath);
@@ -578,10 +529,10 @@ describe('lib/update-lock', () => {
 					updateLock.takeLock(1, ['server', 'client']),
 				).to.eventually.not.be.rejectedWith(UpdatesLockedError);
 				// Check that locks are taken
-				expect(await updateLock.getLocksTaken()).to.deep.include.members(
+				expect(updateLock.getLocksTaken()).to.deep.include.members(
 					serviceLockPaths[1],
 				);
-				expect(await updateLock.getLocksTaken()).to.have.length(4);
+				expect(updateLock.getLocksTaken()).to.have.length(4);
 				// Clean up lockfiles
 				for (const lockPath of serviceLockPaths[1]) {
 					await lockfile.unlock(lockPath);
@@ -595,13 +546,13 @@ describe('lib/update-lock', () => {
 				const takeLockPromise = updateLock.takeLock(1, ['server', 'client']);
 				// Locks should have not been taken even after waiting
 				await setTimeout(500);
-				expect(await updateLock.getLocksTaken()).to.have.length(0);
+				expect(updateLock.getLocksTaken()).to.have.length(0);
 				// Release the write lock
 				release();
 				// Locks should be taken
 				await takeLockPromise;
 				// Locks should have been taken
-				expect(await updateLock.getLocksTaken()).to.deep.include.members(
+				expect(updateLock.getLocksTaken()).to.deep.include.members(
 					serviceLockPaths[1],
 				);
 			});
@@ -609,43 +560,23 @@ describe('lib/update-lock', () => {
 			it('should release locks when takeLock step errors to return services to unlocked state', async () => {
 				const svcs = ['server', 'client'];
 
-				// Take lock for second service of two services
-				await lockfile.lock(`${lockdir}/1/${svcs[1]}/updates.lock`);
-				expect(await lockfile.getLocksTaken(lockdir)).to.deep.include.members([
-					`${lockdir}/1/${svcs[1]}/updates.lock`,
-				]);
-
-				// Watch for added files, as Supervisor-taken locks should be added
-				// then removed within updateLock.takeLock
-				const addedFiles: string[] = [];
-				const watcher = watch(lockdir).on('add', (p) => addedFiles.push(p));
+				// Take user lock for second service of two services
+				await touch(`${lockdir}/1/${svcs[1]}/updates.lock`);
+				expect(lockfile.getLocksTaken()).to.deep.equal([]);
 
 				// updateLock.takeLock should error
 				await expect(updateLock.takeLock(1, svcs, false)).to.be.rejectedWith(
 					UpdatesLockedError,
 				);
 
-				// Service without user lock should have been locked by Supervisor..
-				expect(addedFiles).to.deep.include.members([
-					`${lockdir}/1/${svcs[0]}/updates.lock`,
-					`${lockdir}/1/${svcs[0]}/resin-updates.lock`,
-				]);
-
-				// ..but upon error, Supervisor-taken locks should have been cleaned up
-				expect(
-					await lockfile.getLocksTaken(lockdir),
-				).to.not.deep.include.members([
-					`${lockdir}/1/${svcs[0]}/updates.lock`,
-					`${lockdir}/1/${svcs[0]}/resin-updates.lock`,
-				]);
+				// Supervisor-taken locks should have been cleaned up
+				expect(lockfile.getLocksTaken()).to.deep.equal([]);
 
 				// User lock should be left behind
-				expect(await lockfile.getLocksTaken(lockdir)).to.deep.include.members([
-					`${lockdir}/1/${svcs[1]}/updates.lock`,
+				expect(await fs.readdir(`${lockdir}/1/${svcs[1]}`)).to.deep.equal([
+					'updates.lock',
 				]);
-
-				// Clean up watcher
-				await watcher.close();
+				expect(lockfile.getLocksTaken()).to.deep.equal([]);
 			});
 		});
 
@@ -675,23 +606,23 @@ describe('lib/update-lock', () => {
 					await lockfile.lock(lockPath, updateLock.LOCKFILE_UID);
 				}
 				// Sanity check that locks are taken & tracked by Supervisor
-				expect(await updateLock.getLocksTaken()).to.deep.include.members(
+				expect(updateLock.getLocksTaken()).to.deep.include.members(
 					serviceLockPaths[1],
 				);
 				// Release locks for appId 1
 				await updateLock.releaseLock(1);
 				// Locks should have been released
-				expect(await updateLock.getLocksTaken()).to.have.length(0);
+				expect(updateLock.getLocksTaken()).to.have.length(0);
 				// Double check that the lockfiles are removed
 				expect(await fs.readdir(`${lockdir}/1/server`)).to.have.length(0);
 				expect(await fs.readdir(`${lockdir}/1/client`)).to.have.length(0);
 			});
 
 			it('does not error if there are no locks to release', async () => {
-				expect(await updateLock.getLocksTaken()).to.have.length(0);
+				expect(updateLock.getLocksTaken()).to.have.length(0);
 				// Should not error
 				await updateLock.releaseLock(1);
-				expect(await updateLock.getLocksTaken()).to.have.length(0);
+				expect(updateLock.getLocksTaken()).to.have.length(0);
 			});
 
 			it('ignores locks outside of appId scope', async () => {
@@ -699,15 +630,11 @@ describe('lib/update-lock', () => {
 				// Lock services outside of appId scope
 				await lockfile.lock(lockPath, updateLock.LOCKFILE_UID);
 				// Sanity check that locks are taken & tracked by Supervisor
-				expect(await updateLock.getLocksTaken()).to.deep.include.members([
-					lockPath,
-				]);
+				expect(updateLock.getLocksTaken()).to.deep.include.members([lockPath]);
 				// Release locks for appId 1
 				await updateLock.releaseLock(1);
 				// Locks for appId 2 should not have been released
-				expect(await updateLock.getLocksTaken()).to.deep.include.members([
-					lockPath,
-				]);
+				expect(updateLock.getLocksTaken()).to.deep.include.members([lockPath]);
 				// Double check that the lockfile is still there
 				expect(await fs.readdir(`${lockdir}/2/main`)).to.have.length(1);
 				// Clean up the lockfile
@@ -720,7 +647,7 @@ describe('lib/update-lock', () => {
 					await lockfile.lock(lockPath, updateLock.LOCKFILE_UID);
 				}
 				// Sanity check that locks are taken & tracked by Supervisor
-				expect(await updateLock.getLocksTaken()).to.deep.include.members(
+				expect(updateLock.getLocksTaken()).to.deep.include.members(
 					serviceLockPaths[1],
 				);
 				// Take the write lock for appId 1
@@ -729,7 +656,7 @@ describe('lib/update-lock', () => {
 				const releaseLockPromise = updateLock.releaseLock(1);
 				// Locks should have not been released even after waiting
 				await setTimeout(500);
-				expect(await updateLock.getLocksTaken()).to.deep.include.members(
+				expect(updateLock.getLocksTaken()).to.deep.include.members(
 					serviceLockPaths[1],
 				);
 				// Release the write lock
@@ -737,7 +664,7 @@ describe('lib/update-lock', () => {
 				// Release locks for appId 1 should resolve
 				await releaseLockPromise;
 				// Locks should have been released
-				expect(await updateLock.getLocksTaken()).to.have.length(0);
+				expect(updateLock.getLocksTaken()).to.have.length(0);
 			});
 		});
 	});

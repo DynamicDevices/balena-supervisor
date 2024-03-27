@@ -9,10 +9,28 @@ import { isENOENT, isEISDIR, isEPERM } from './errors';
 // Equivalent to `drwxrwxrwt`
 const STICKY_WRITE_PERMISSIONS = 0o1777;
 
+const locksTakenStore = new Set<string>();
+
+export const getLocksTaken = () => {
+	return Array.from(locksTakenStore);
+};
+
+export const initializeLocksTaken = async (
+	lockDir: string,
+	lockFilter: (path: string, stat: Stats) => boolean,
+) => {
+	const locksTaken = await readLocksTakenFromFs(lockDir, lockFilter);
+	locksTakenStore.clear();
+	locksTaken.forEach((l) => locksTakenStore.add(l));
+};
+
 // Returns all current locks taken under a directory (default: /tmp)
 // Optionally accepts filter function for only getting locks that match a condition.
 // A file is counted as a lock by default if it ends with `.lock`.
-export const getLocksTaken = async (
+//
+// As this function reads from the filesystem, it is only suitable during startup
+// to get an initial list of locks taken.
+const readLocksTakenFromFs = async (
 	rootDir: string = '/tmp',
 	lockFilter: (path: string, stat: Stats) => boolean = (p) =>
 		p.endsWith('.lock'),
@@ -34,7 +52,7 @@ export const getLocksTaken = async (
 			locksTaken.push(lockPath);
 			// Otherwise, if non-lock directory, seek locks recursively within directory
 		} else if (fileOrDir.isDirectory()) {
-			locksTaken.push(...(await getLocksTaken(lockPath, lockFilter)));
+			locksTaken.push(...(await readLocksTakenFromFs(lockPath, lockFilter)));
 		}
 	}
 	return locksTaken;
@@ -87,6 +105,8 @@ export async function lock(path: string, uid: number = os.userInfo().uid) {
 	try {
 		// Lock the file using binary
 		await exec(`lockfile -r 0 ${path}`, { uid });
+		// Store lock path in memory
+		locksTakenStore.add(path);
 	} catch (error) {
 		// Code 73 refers to EX_CANTCREAT (73) in sysexits.h, or:
 		// A (user specified) output file cannot be created.
@@ -127,4 +147,6 @@ export async function unlock(path: string): Promise<void> {
 		// If the file does not exist or some other error
 		// happens, then ignore the error
 	});
+	// Remove lock path from memory
+	locksTakenStore.delete(path);
 }

@@ -17,7 +17,7 @@ import {
 	ContractViolationError,
 	InternalInconsistencyError,
 } from '../lib/errors';
-import { getServicesLockedByAppId, LocksTakenMap } from '../lib/update-lock';
+import * as updateLock from '../lib/update-lock';
 import { checkTruthy } from '../lib/validation';
 
 import App from './app';
@@ -85,6 +85,7 @@ export const validActions = Object.keys(actionExecutors);
 
 export const initialized = _.once(async () => {
 	await config.initialized();
+	await updateLock.initialized();
 
 	await imageManager.cleanImageData();
 	const cleanup = async () => {
@@ -150,7 +151,7 @@ export async function getRequiredSteps(
 		downloading,
 		availableImages,
 		containerIdsByAppId,
-		locksTaken: await getServicesLockedByAppId(),
+		locksTaken: await updateLock.getServicesLockedByAppId(),
 	});
 }
 
@@ -168,7 +169,7 @@ export async function inferNextSteps(
 		containerIdsByAppId = {} as {
 			[appId: number]: UpdateState['containerIds'];
 		},
-		locksTaken = new LocksTakenMap(),
+		locksTaken = new updateLock.LocksTakenMap(),
 	} = {},
 ) {
 	const currentAppIds = Object.keys(currentApps).map((i) => parseInt(i, 10));
